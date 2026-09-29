@@ -1,0 +1,287 @@
+name: Create OCI Always Free ARM instance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/10 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-oci-free-arm-launch
+  cancel-in-progress: false
+
+jobs:
+  launch-instance:
+    name: Launch OCI Ampere A1 instance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9
+
+    steps:
+      - name: Install OCI CLI 3.92.0
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          venv_dir="${RUNNER_TEMP}/oci-cli-3.92.0"
+          python3 -m venv "${venv_dir}"
+          "${venv_dir}/bin/python" -m pip install \
+            --disable-pip-version-check \
+            'oci-cli==3.92.0'
+          printf '%s\n' "${venv_dir}/bin" >> "${GITHUB_PATH}"
+          "${venv_dir}/bin/oci" --version
+
+      - name: Validate configuration and launch instance
+        shell: bash
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+          OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_INSTANCE_NAME: ${{ secrets.OCI_INSTANCE_NAME }}
+        run: |
+          set -Eeuo pipefail
+
+          required_names=(
+            OCI_TENANCY_OCID
+            OCI_USER_OCID
+            OCI_FINGERPRINT
+            OCI_PRIVATE_KEY
+            OCI_REGION
+            OCI_COMPARTMENT_OCID
+            OCI_AVAILABILITY_DOMAIN
+            OCI_SUBNET_OCID
+            OCI_IMAGE_OCID
+            OCI_SSH_PUBLIC_KEY
+            OCI_INSTANCE_NAME
+          )
+
+          missing_names=()
+          for name in "${required_names[@]}"; do
+            value="${!name-}"
+            if [[ -z "${value//[[:space:]]/}" ]]; then
+              missing_names+=("${name}")
+            fi
+          done
+
+          if (( ${#missing_names[@]} > 0 )); then
+            printf 'Missing required GitHub Actions Secrets:\n' >&2
+            printf '  - %s\n' "${missing_names[@]}" >&2
+            exit 1
+          fi
+
+          single_line_names=(
+            OCI_TENANCY_OCID
+            OCI_USER_OCID
+            OCI_FINGERPRINT
+            OCI_REGION
+            OCI_COMPARTMENT_OCID
+            OCI_AVAILABILITY_DOMAIN
+            OCI_SUBNET_OCID
+            OCI_IMAGE_OCID
+            OCI_INSTANCE_NAME
+          )
+          for name in "${single_line_names[@]}"; do
+            value="${!name}"
+            if [[ "${value}" == *$'\n'* || "${value}" == *$'\r'* ]]; then
+              printf 'Secret %s must be a single line.\n' "${name}" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "${OCI_SSH_PUBLIC_KEY}" == *$'\n'* || "${OCI_SSH_PUBLIC_KEY}" == *$'\r'* ]]; then
+            printf 'Secret OCI_SSH_PUBLIC_KEY must contain one OpenSSH public key line.\n' >&2
+            exit 1
+          fi
+          if [[ "${OCI_SSH_PUBLIC_KEY}" == *'PRIVATE KEY'* ]]; then
+            printf 'Secret OCI_SSH_PUBLIC_KEY contains private-key material.\n' >&2
+            exit 1
+          fi
+
+          auth_dir="$(mktemp -d "${RUNNER_TEMP}/oci-auth.XXXXXX")"
+          config_file="${auth_dir}/config"
+          private_key_file="${auth_dir}/oci_api_key.pem"
+          ssh_public_key_file="${auth_dir}/authorized_key.pub"
+
+          cleanup() {
+            rm -rf "${auth_dir}"
+          }
+          trap cleanup EXIT
+          trap 'exit 129' HUP
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+
+          umask 077
+          printf '%s\n' "${OCI_PRIVATE_KEY}" > "${private_key_file}"
+          printf '%s\n' "${OCI_SSH_PUBLIC_KEY}" > "${ssh_public_key_file}"
+          chmod 600 "${private_key_file}" "${ssh_public_key_file}"
+
+          if ! ssh-keygen -l -f "${ssh_public_key_file}" >/dev/null 2>&1; then
+            printf 'OCI_SSH_PUBLIC_KEY must be a valid OpenSSH public key.\n' >&2
+            exit 1
+          fi
+
+          if ! openssl rsa \
+            -in "${private_key_file}" \
+            -passin pass: \
+            -check \
+            -noout >/dev/null 2>&1; then
+            printf 'OCI_PRIVATE_KEY must be an unencrypted RSA PEM private key.\n' >&2
+            exit 1
+          fi
+
+          key_bits="$(
+            openssl rsa \
+              -in "${private_key_file}" \
+              -passin pass: \
+              -text \
+              -noout 2>/dev/null |
+              sed -nE 's/^Private-Key: \(([0-9]+) bit.*$/\1/p' |
+              head -n 1
+          )"
+          if [[ ! "${key_bits}" =~ ^[0-9]+$ ]] || (( key_bits < 2048 )); then
+            printf 'OCI_PRIVATE_KEY must use an RSA key of at least 2048 bits.\n' >&2
+            exit 1
+          fi
+
+          cat > "${config_file}" <<EOF
+          [DEFAULT]
+          user=${OCI_USER_OCID}
+          fingerprint=${OCI_FINGERPRINT}
+          key_file=${private_key_file}
+          tenancy=${OCI_TENANCY_OCID}
+          region=${OCI_REGION}
+          EOF
+          chmod 600 "${config_file}"
+
+          list_instances() {
+            oci compute instance list \
+              --config-file "${config_file}" \
+              --compartment-id "${OCI_COMPARTMENT_OCID}" \
+              --all \
+              --output json
+          }
+
+          instances_json="$(list_instances)"
+          if ! jq -e '.data | type == "array"' >/dev/null <<< "${instances_json}"; then
+            printf 'OCI ListInstances returned an unexpected response.\n' >&2
+            exit 1
+          fi
+
+          matches_json="$(
+            jq -c \
+              --arg name "${OCI_INSTANCE_NAME}" \
+              '[.data[] | select(
+                .["display-name"] == $name and
+                .["lifecycle-state"] != "TERMINATED"
+              ) | {
+                id: .id,
+                state: .["lifecycle-state"]
+              }]' \
+              <<< "${instances_json}"
+          )"
+          match_count="$(jq -r 'length' <<< "${matches_json}")"
+
+          if (( match_count > 0 )); then
+            printf 'Found %s active instance(s) with the configured display name; skipping launch.\n' \
+              "${match_count}"
+            if (( match_count > 1 )); then
+              printf 'Multiple active instances share the configured name; review them manually.\n' >&2
+            fi
+
+            {
+              printf '### OCI ARM instance launch skipped\n\n'
+              printf 'An active instance already uses the configured display name.\n\n'
+              printf '| Instance OCID | Lifecycle state | Region |\n'
+              printf '| --- | --- | --- |\n'
+              jq -r \
+                --arg region "${OCI_REGION}" \
+                '.[] | "| `\(.id)` | `\(.state)` | `\($region)` |"' \
+                <<< "${matches_json}"
+              if (( match_count > 1 )); then
+                printf '\nReview the duplicate active instances manually before the next launch.\n'
+              fi
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          printf 'No active instance uses the configured display name; submitting launch request.\n'
+          launch_json="$(
+            oci compute instance launch \
+              --config-file "${config_file}" \
+              --availability-domain "${OCI_AVAILABILITY_DOMAIN}" \
+              --compartment-id "${OCI_COMPARTMENT_OCID}" \
+              --display-name "${OCI_INSTANCE_NAME}" \
+              --shape 'VM.Standard.A1.Flex' \
+              --shape-config '{"ocpus":2,"memoryInGBs":12}' \
+              --image-id "${OCI_IMAGE_OCID}" \
+              --subnet-id "${OCI_SUBNET_OCID}" \
+              --assign-public-ip true \
+              --boot-volume-size-in-gbs 50 \
+              --ssh-authorized-keys-file "${ssh_public_key_file}" \
+              --output json
+          )"
+
+          instance_id="$(jq -er '.data.id | select(type == "string" and length > 0)' <<< "${launch_json}")"
+          printf 'OCI accepted the launch request; polling ListInstances for visibility.\n'
+
+          visible_instance=''
+          for attempt in $(seq 1 20); do
+            poll_json="$(list_instances)"
+            if ! jq -e '.data | type == "array"' >/dev/null <<< "${poll_json}"; then
+              printf 'OCI ListInstances returned an unexpected response during polling.\n' >&2
+              exit 1
+            fi
+
+            visible_instance="$(
+              jq -c \
+                --arg id "${instance_id}" \
+                --arg name "${OCI_INSTANCE_NAME}" \
+                '.data[] | select(
+                  .id == $id and
+                  .["display-name"] == $name
+                ) | {
+                  id: .id,
+                  state: .["lifecycle-state"]
+                }' \
+                <<< "${poll_json}" |
+                head -n 1
+            )"
+
+            if [[ -n "${visible_instance}" ]]; then
+              break
+            fi
+
+            if (( attempt < 20 )); then
+              sleep 15
+            fi
+          done
+
+          if [[ -z "${visible_instance}" ]]; then
+            printf 'Launched instance did not become visible through ListInstances within 5 minutes.\n' >&2
+            exit 1
+          fi
+
+          lifecycle_state="$(jq -r '.state' <<< "${visible_instance}")"
+          if [[ "${lifecycle_state}" == 'TERMINATED' ]]; then
+            printf 'The launched instance entered TERMINATED state.\n' >&2
+            exit 1
+          fi
+
+          {
+            printf '### OCI ARM instance launch submitted\n\n'
+            printf '| Instance OCID | Lifecycle state | Region | Shape | OCPUs | Memory | Boot volume |\n'
+            printf '| --- | --- | --- | --- | ---: | ---: | ---: |\n'
+            printf '| `%s` | `%s` | `%s` | `VM.Standard.A1.Flex` | 2 | 12 GB | 50 GB |\n' \
+              "${instance_id}" "${lifecycle_state}" "${OCI_REGION}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          printf 'Launch request completed and the instance is visible in lifecycle state %s.\n' \
+            "${lifecycle_state}"
